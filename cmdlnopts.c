@@ -41,7 +41,9 @@ glob_pars const Gdefault = {
     NULL,           // speeds of interfaces (if differs)
     0,              // number of rest parameters
     57600,          // common speed for all terminals
-    NULL            // the rest parameters: array of char*
+    NULL,           // name of common log file (dublicate of stdout)
+    NULL,           // the rest parameters: array of char*
+    0               // use character mode instead of lines
 };
 
 /*
@@ -54,6 +56,9 @@ myoption cmdlnopts[] = {
     {"port",    MULT_PAR,   NULL,   'p',    arg_string, APTR(&G.ports),     _("input port (also you can name it without any key)")},
     {"totalrate",NEED_ARG,  NULL,   't',    arg_int,    APTR(&G.glob_spd),  _("global baudrate for all interfaces")},
     {"baudrate",MULT_PAR,   NULL,   'b',    arg_int,    APTR(&G.speeds),    _("baudrate for given port")},
+    {"all-log", NEED_ARG,   NULL,   'o',    arg_string, APTR(&G.commonlog), _("filename of common log")},
+    {"rewrite", NO_ARGS,    NULL,   'r',    arg_none,   APTR(&rewrite_ifexists),_("rewrite existing log files")},
+    {"char-mode",NO_ARGS,   NULL,   'c',    arg_none,   APTR(&G.charmode),  _("use character mode instead of lines")},
     end_option
 };
 

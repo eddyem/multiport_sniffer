@@ -2,9 +2,10 @@ PROGRAM = multiterm
 LDFLAGS =
 SRCS = $(wildcard *.c)
 CC = gcc
-DEFINES = -DEBUG -D_XOPEN_SOURCE=1111
+DEFINES = -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=1111
+#DEFINES += -DEBUG
 CXX = gcc
-CFLAGS = -Wall -Werror -Wextra $(DEFINES)
+CFLAGS = -Wall -Werror -Wextra -std=gnu99 $(DEFINES)
 OBJS = $(SRCS:.c=.o)
 all : $(PROGRAM)
 $(PROGRAM) : $(OBJS)

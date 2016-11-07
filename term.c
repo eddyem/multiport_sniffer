@@ -29,19 +29,67 @@
 #include <string.h>         // memcpy
 #include <stdint.h>         // int types
 #include <sys/time.h>       // gettimeofday
+#include <unistd.h>         // usleep
+//#include <pthread.h>
 
 #include "term.h"
 #include "usefull_macros.h"
+
+#define LOGBUFSZ (1024)
 
 typedef struct {
     int speed;  // communication speed in bauds/s
     int bspeed; // baudrate from termios.h
 } spdtbl;
 
-char *comdev = "/dev/ttyACM0";
-int BAUD_RATE = B115200;
-struct termio oldtty, tty; // TTY flags
-int comfd; // TTY fd
+typedef struct {
+    char *portname;         // device filename (should be freed before structure freeing)
+    int baudrate;           // baudrate (B...)
+    struct termio oldtty;   // TTY flags for previous port settings
+    struct termio tty;      // TTY flags for current settings
+    int comfd;              // TTY file descriptor
+    int logfd;              // log file descriptor
+    char logbuf[LOGBUFSZ];  // buffer for data readed
+    int logbuflen;          // length of data in logbuf
+    char linerdy;           // flag of getting '\n' in input data
+    //pthread_t thread;       // thread identificator for kill/join
+} TTY_descr;
+
+// global mutex for all threads writing to common log file / stdout
+//static pthread_mutex_t write_mutex;
+// array of opened TTY descriptors
+static TTY_descr *descriptors = NULL;
+// amount of opened descriptors
+static int descr_amount = 0;
+// common log fd
+static int common_fd = 0;
+// max value of comfd - for select()
+static int maxfd = 0;
+// name of common log file
+static char *commonlogname = NULL;
+// time of start
+static double t0 = -10.;
+// character mode
+static int charmode = 0;
+
+// in cmdlnopts.c
+extern int rewrite_ifexists;
+
+static int tty_init(TTY_descr *descr);
+static void restore_ttys();
+static void write_logblocks(char force);
+
+/**
+ * change value of common log filename
+ */
+void set_comlogname(char* nm){
+    FREE(commonlogname);
+    commonlogname = strdup(nm);
+}
+
+void set_charmode(){
+    charmode = 1;
+}
 
 //sed 's/[^ ]* *B\([^ ]*\).*/    {\1, B\1},/g'
 /*
@@ -133,41 +181,65 @@ int conv_spd(int speed){
  * @param ex_stat - status (return code)
  */
 void term_quit(int ex_stat){
-    restore_console();
-    restore_tty();
-    ioctl(comfd, TCSANOW, &oldtty ); // return TTY to previous state
-    close(comfd);
-    restore_console();
+    restore_ttys();
     WARNX("Exit! (%d)\n", ex_stat);
     exit(ex_stat);
 }
 
 /**
- * Open & setup TTY, terminal
+ * Open & setup terminal
+ * @param descr (io) - port descriptor
+ * @return 0 if all OK
  */
-void tty_init(){
-    DBG("\nOpen port...\n");
-    if ((comfd = open(comdev,O_RDWR|O_NOCTTY|O_NONBLOCK)) < 0){
-        ERR(_("Can't use port %s\n"), comdev);
+static int tty_init(TTY_descr *descr){
+    DBG("\nOpen port...");
+    if ((descr->comfd = open(descr->portname, O_RDONLY|O_NOCTTY|O_NONBLOCK)) < 0){
+        WARN(_("Can't use port %s"), descr->portname);
+        return globErr ? globErr : 1;
     }
-    DBG(" OK\nGet current settings...\n");
-    if(ioctl(comfd,TCGETA,&oldtty) < 0){ // Get settings
-        ERR(_("Can't get old TTY settings"));
+    DBG("OK\nGet current settings...");
+    if(ioctl(descr->comfd, TCGETA, &descr->oldtty) < 0){ // Get settings
+        WARN(_("Can't get old TTY settings"));
+        return globErr ? globErr : 1;
     }
-    tty = oldtty;
-    tty.c_lflag     = 0; // ~(ICANON | ECHO | ECHOE | ISIG)
-    tty.c_oflag     = 0;
-    tty.c_cflag     = BAUD_RATE|CS8|CREAD|CLOCAL; // 9.6k, 8N1, RW, ignore line ctrl
-    tty.c_cc[VMIN]  = 0;  // non-canonical mode
-    tty.c_cc[VTIME] = 5;
-    if(ioctl(comfd, TCSETA, &tty) < 0){
-        ERR(_("Can't apply new TTY settings"));
+    descr->tty = descr->oldtty;
+    struct termio  *tty = &descr->tty;
+    tty->c_lflag     = 0; // ~(ICANON | ECHO | ECHOE | ISIG)
+    tty->c_oflag     = 0;
+    tty->c_cflag     = descr->baudrate|CS8|CREAD|CLOCAL; // 9.6k, 8N1, RW, ignore line ctrl
+    tty->c_cc[VMIN]  = 0;  // non-canonical mode
+    tty->c_cc[VTIME] = 5;
+    if(ioctl(descr->comfd, TCSETA, &descr->tty) < 0){
+        WARN(_("Can't apply new TTY settings"));
+        return globErr ? globErr : 1;
     }
-    DBG(" OK\n");
+    if(descr->comfd >= maxfd) maxfd = descr->comfd + 1;
+    DBG("OK");
+    return 0;
 }
 
-void restore_tty(){
-    return;
+/**
+ * Restore all opened TTYs to previous state, close them and free all memory
+ * occupied by their descriptors
+ */
+static void restore_ttys(){
+    FNAME();
+    write_logblocks(1); // write rest of data
+    for(int i = 0; i < descr_amount; ++i){
+        TTY_descr *d = &descriptors[i];
+        DBG("%dth TTY: %s", i, d->portname);
+        FREE(d->portname);
+        if(!d->comfd) continue; // not opened
+        DBG("close file..");
+        ioctl(d->comfd, TCSANOW, &d->oldtty); // return TTY to previous state
+        close(d->comfd);
+        DBG("close log file..");
+        if(d->logfd > 0)
+            close(d->logfd);
+        DBG("done!\n");
+    }
+    FREE(descriptors);
+    descr_amount = 0;
 }
 
 /**
@@ -188,8 +260,8 @@ int mygetchar(){
  * @param length (io) - buff's length (return readed len or 0)
  * @param rb (o)      - byte readed from console or -1
  * @return 1 if something was readed here or there
- */
-int read_tty_and_console(char *buff, size_t *length, int *rb){
+ *
+static int read_tty_and_console(char *buff, size_t *length, int *rb){
     ssize_t L;
     // ssize_t l;
     size_t buffsz = *length;
@@ -213,13 +285,13 @@ int read_tty_and_console(char *buff, size_t *length, int *rb){
                 WARN(_("TTY error or disconnected!\n"));
             }else{
                 // all OK continue reading
-        /*      DBG("readed %zd bytes, try more.. ", L);
+        *      DBG("readed %zd bytes, try more.. ", L);
                 buffsz -= L;
                 while(buffsz > 0 && (l = read(comfd, buff+L, buffsz)) > 0){
                     L += l;
                     buffsz -= l;
                 }
-                DBG("full len: %zd\n", L); */
+                DBG("full len: %zd\n", L); *
                 *length = (size_t) L;
                 retval = 1;
             }
@@ -228,38 +300,180 @@ int read_tty_and_console(char *buff, size_t *length, int *rb){
         }
     }
     return retval;
-}
-
-void con_sig(int rb){
+}*/
+/*
+static void con_sig(int rb){
     char cmd;
     if(rb < 1) return;
     if(rb == 'q') term_quit(0); // q == exit
     cmd = (char) rb;
     write(comfd, &cmd, 1);
-    /*switch(rb){
+    *switch(rb){
         case 'h':
             help();
         break;
         default:
             cmd = (uint8_t) rb;
             write(comfd, &cmd, 1);
-    }*/
+    }*
+}*/
+
+/**
+ * Create log file (open in exclusive mode: error if file exists)
+ * @param  descr - device descriptor
+ * @return fd of opened file if all OK, 0 in case of error
+ */
+int create_log(TTY_descr *descr){
+    int fd;
+    char fdname[256], *filedev;
+    if(!(filedev = strrchr(descr->portname, '/'))) filedev = descr->portname;
+    else{
+        ++filedev;
+        if(!*filedev) filedev = descr->portname;
+    }
+    snprintf(fdname, 256, "log_%s.txt", filedev);
+    int oflag = O_WRONLY | O_CREAT;
+    if(rewrite_ifexists) oflag |= O_TRUNC;
+    else oflag |= O_EXCL;
+    if ((fd = open(fdname, oflag,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH )) == -1){
+        WARN("open(%s) failed", fdname);
+        return 0;
+    }
+    DBG("%s opened", fdname);
+    descr->logfd = fd;
+    return fd;
 }
 
 /**
- * Open all TTY's from given lists
+ * Open terminal & do initial setup
+ * @param port - port device filename
+ * @param spd  - speed (for ioctl TCSETA)
+ * @return pointer to descriptor if all OK or NULL in case of error
+ */
+static TTY_descr *prepare_tty(TTY_descr *descr){
+    if(!descr->portname) return NULL;
+    if(tty_init(descr)){
+        WARNX(_("Can't open device %s"), descr->portname);
+        return NULL;
+    }
+    if(!create_log(descr)) return NULL;
+    return descr;
+}
+
+/**
+ * read all TTYs, put data into linebuffers & store full lines in log file
+ * @return 1 if any buffer became full
+ */
+static int read_ttys(){
+    struct timeval tv;
+    int i, sel, retval = 0;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    for(i = 0; i < descr_amount; ++i)
+        FD_SET(descriptors[i].comfd, &rfds);
+    // wait no more than 10ms
+    tv.tv_sec = 0; tv.tv_usec = 10000;
+    sel = select(maxfd, &rfds, NULL, NULL, &tv);
+    TTY_descr *d = descriptors;
+    if(sel > 0) for(i = 0; i < descr_amount; ++i, ++d){
+        int bsyctr = 0;
+        if(FD_ISSET(d->comfd, &rfds)){
+            size_t L = d->logbuflen;
+            //DBG("%s got data (have %zd)",  d->portname, L);
+            char *bufptr = d->logbuf + L;
+            while(L < LOGBUFSZ){
+                usleep(1000);
+                if(read(d->comfd, bufptr, 1) < 1){ // disconnect or other troubles
+                    if(errno == EAGAIN){ // file was blocked outside
+                        if(bsyctr++ < 10) continue;
+                        break;
+                    }
+                    WARN(_("Some error or %s disconnected"), d->portname);
+                    break;
+                }else{
+                    bsyctr = 0;
+                    // all OK continue reading
+                    ++L;
+                    if(*bufptr++ == '\n'){ // line ready
+                        d->linerdy = 1;
+                        retval = 1;
+                        break;
+                    }
+                }
+            }
+            descriptors[i].logbuflen = L;
+            if(L == LOGBUFSZ || charmode) retval = 1; // buffer is full - write data to logs
+        }
+    }
+    return retval;
+}
+
+/**
+ * Open all TTY's from given lists & start monitoring
  * @param ports     - TTY device filename
  * @param speeds    - array of speeds or NULL
  * @param globspeed - common speed for all ports (if `speeds` not NULL)
  */
 void ttys_open(char **ports, int **speeds, int globspeed){
-    int commonspd = 0;
+    int commonspd = 0, N = 0;
     if(!speeds) commonspd = conv_spd(globspeed);
+    // count amount of ports to open
+    char **p = ports;
+    for(descr_amount = 0; *p; ++descr_amount, ++p);
+    DBG("User wanna open %d descriptors", descr_amount);
+    descriptors = MALLOC(TTY_descr, descr_amount); // allocate memory for descriptors array
     while(*ports){
         int spd = commonspd ? commonspd : conv_spd(**speeds);
         DBG("open %s with speed %d (%d)", *ports, commonspd ? globspeed : **speeds, spd);
-        ;
+        TTY_descr *cur_descr = &descriptors[N++];
+        cur_descr->portname = strdup(*ports);
+        cur_descr->baudrate = spd;
+        if(!prepare_tty(cur_descr)) term_quit(globErr);
         ++ports;
         if(!commonspd) ++speeds;
+    }
+    if(commonlogname){ // open common log file - non-critical
+        int oflag = O_WRONLY | O_CREAT;
+        if(rewrite_ifexists) oflag |= O_TRUNC; // truncate if -r passed
+        if ((common_fd = open(commonlogname, oflag,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH )) == -1)
+                WARN("open(%s) failed", commonlogname);
+    }
+    // start monitoring
+    while(1){
+        if(read_ttys()) write_logblocks(0);
+    }
+}
+
+/**
+ * Write all received data into log files
+ * @param force == 1 to write all data (@ exit)
+ */
+static void write_logblocks(char force){
+    TTY_descr *d = descriptors;
+    char tmbuf[256];
+    if(t0 < 0.) t0 = dtime();
+    double twr = dtime() - t0;
+    for(int i = 0; i < descr_amount; ++i, ++d){
+        if(charmode || (force && d->logbuflen) || d->linerdy || d->logbuflen == LOGBUFSZ){
+            // write trailing '\n' if `force` active
+            int writen = ((force || charmode) && !d->linerdy) ? 1 : 0;
+            size_t L = snprintf(tmbuf, 256, "%g\n", twr);
+            write(d->logfd, tmbuf, L);
+            write(d->logfd, d->logbuf, d->logbuflen);
+            if(writen) write(d->logfd, "\n", 1);
+            L = snprintf(tmbuf, 256, "%g: %s\n", twr, d->portname);
+            write(1, tmbuf, L);
+            write(1, d->logbuf, d->logbuflen);
+            if(writen) write(1, "\n", 1);
+            if(common_fd > 0){
+                write(common_fd, tmbuf, L);
+                write(common_fd, d->logbuf, d->logbuflen);
+                if(writen) write(common_fd, "\n", 1);
+            }
+            d->linerdy = 0;
+            d->logbuflen = 0;
+        }
     }
 }

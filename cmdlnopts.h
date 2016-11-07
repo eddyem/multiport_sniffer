@@ -34,7 +34,9 @@ typedef struct{
     int **speeds;       // speeds of interfaces (if differs)
     int rest_pars_num;  // number of rest parameters
     int glob_spd;       // common speed for all terminals
+    char *commonlog;    // name of common log file (dublicate of stdout)
     char** rest_pars;   // the rest parameters: array of char*
+    int charmode;       // use character mode instead of lines
 } glob_pars;
 
 

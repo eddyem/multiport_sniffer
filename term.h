@@ -25,9 +25,10 @@
 #include <termios.h>        // tcsetattr, baudrates
 
 void term_quit(int ex_stat);
-void restore_tty();
 int conv_spd(int speed);
-
 void ttys_open(char **ports, int **speeds, int globspeed);
+
+void set_comlogname(char* nm);
+void set_charmode();
 
 #endif // __TERM_H__

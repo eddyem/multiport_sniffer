@@ -26,6 +26,7 @@
 #define BUFLEN 1024
 
 void signals(int sig){
+    //restore_console();
     term_quit(sig);
 }
 
@@ -61,13 +62,13 @@ int main(int argc, char *argv[]){
         //gpamount; // for terminating NULL
         for(i = curno; i < gpamount; ++i){
             DBG("Add by free param (#%d): %s", i, *ptr);
-            Glob->ports[i] = *ptr++;
+            Glob->ports[i] = strdup(*ptr++);
         }
         Glob->ports[gpamount] = NULL;
     }
     if(!Glob->ports)
         ERRX(_("You should give at least name of one port"));
-    setup_con();
+    //setup_con();
     signal(SIGHUP,  signals);
     signal(SIGTERM, signals);   // kill (-15)
     signal(SIGINT,  signals);   // ctrl+C
@@ -89,7 +90,12 @@ int main(int argc, char *argv[]){
             ERRX(_("Amount of ports given, %d, not equal to amount of speeds given, %d!\n"),
                 portsamount, bdramount);
     }
-    // now run threads
+    // open common log filename (additive)
+    if(Glob->commonlog)
+        set_comlogname(Glob->commonlog);
+    if(Glob->charmode)
+        set_charmode();
+    // now run sniffer
     ttys_open(Glob->ports, Glob->speeds, Glob->glob_spd);
     /*
     double t0 = dtime();
